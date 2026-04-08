@@ -129,9 +129,11 @@ class ExplorationHandler:
                 return
             self._processing = True
         self.publish_state()
+        self._svc.set_handler_error("explore", None)
 
         try:
             # 1. Request frame capture
+            self._svc.set_handler_state("explore", "capturing")
             logger.info("Requesting frame capture...")
             self._frame_event.clear()
             self._frame_path = None
@@ -146,12 +148,14 @@ class ExplorationHandler:
             # 2. Wait for frame
             if not self._frame_event.wait(timeout=FRAME_TIMEOUT):
                 logger.error("Frame capture timed out")
+                self._svc.set_handler_error("explore", "frame capture timed out")
                 return
             self._waiting_for_frame = False
 
             frame_path = self._frame_path
             if not frame_path or not os.path.isfile(frame_path):
                 logger.error("Frame file not found: %s", frame_path)
+                self._svc.set_handler_error("explore", "frame file not found")
                 return
             logger.info("Frame received: %s", frame_path)
 
@@ -159,13 +163,16 @@ class ExplorationHandler:
             b64 = self._encode_image(frame_path)
             if not b64:
                 logger.error("Failed to encode image")
+                self._svc.set_handler_error("explore", "image encoding failed")
                 return
 
             # 4. Analyze with VLM
+            self._svc.set_handler_state("explore", "analyzing")
             logger.info("Analyzing image with VLM...")
             analysis = self._analyze_image(b64)
             if not analysis or not analysis.strip():
                 logger.warning("Empty analysis result")
+                self._svc.set_handler_error("explore", "empty VLM analysis")
                 return
             logger.info("Exploration analysis: %s", analysis)
 
@@ -181,10 +188,12 @@ class ExplorationHandler:
             )
 
             # 6. Synthesize narration
+            self._svc.set_handler_state("explore", "synthesizing")
             logger.info("Synthesizing exploration narration...")
             audio_filename = self._svc.synthesize(analysis, prefix="explore")
             if not audio_filename:
                 logger.error("TTS synthesis failed")
+                self._svc.set_handler_error("explore", "TTS synthesis failed")
                 return
 
             # 7. Play
@@ -193,11 +202,13 @@ class ExplorationHandler:
 
         except Exception as e:
             logger.error("Exploration pipeline error: %s", e, exc_info=True)
+            self._svc.set_handler_error("explore", str(e)[:80])
         finally:
             self._waiting_for_frame = False
             with self._lock:
                 self._processing = False
             self.publish_state()
+            self._svc.set_handler_state("explore", "idle")
 
     def _encode_image(self, image_path):
         """Load image, resize for VLM input, return base64 JPEG."""

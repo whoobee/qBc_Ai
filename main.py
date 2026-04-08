@@ -53,6 +53,8 @@ DEFAULT_MODEL = "AXERA-TECH/Qwen3.5-4B-AX650-GPTQ-Int4-C128-P1152-CTX2047"
 
 TOPIC_STATE = "robot/ai/state"
 TOPIC_HEARTBEAT = "robot/system/heartbeat/ai"
+TOPIC_CURRENT_STATE = "robot/ai/current_state"
+TOPIC_ERROR_INFO = "robot/ai/error_info"
 
 PLAYBACK_VOLUME = 20
 
@@ -90,42 +92,11 @@ class AiService:
 
         self._running = False
         self._axllm_proc = None
+        self._current_state = "starting"
+        self._error_info = "E_OK"
+        self._handlers = []
 
-        # ── 1. LLM server (axllm) ──
-        if not self._ensure_server():
-            raise RuntimeError("LLM server unavailable — cannot start AI service")
-
-        self.llm = OpenAI(api_key="not-needed", base_url=api_url)
-
-        # ── 2. Whisper STT ──
-        logger.info(
-            "Loading Whisper: %s (device=%s, compute=%s)",
-            whisper_model_size, whisper_device, whisper_compute_type,
-        )
-        self.whisper = WhisperModel(
-            whisper_model_size,
-            device=whisper_device,
-            compute_type=whisper_compute_type,
-        )
-        logger.info("Whisper model loaded")
-
-        # ── 3. Piper TTS — validate ──
-        if not os.path.isfile(self.piper_model_path):
-            raise FileNotFoundError(
-                f"Piper voice model not found: {self.piper_model_path}\n"
-                "Download with:\n"
-                "  cd qBc_Ai/piper_models\n"
-                "  wget https://huggingface.co/rhasspy/piper-voices/resolve/main/"
-                "en/en_US/lessac/medium/en_US-lessac-medium.onnx\n"
-                "  wget https://huggingface.co/rhasspy/piper-voices/resolve/main/"
-                "en/en_US/lessac/medium/en_US-lessac-medium.onnx.json"
-            )
-        piper_config = self.piper_model_path + ".json"
-        if not os.path.isfile(piper_config):
-            raise FileNotFoundError(f"Piper config not found: {piper_config}")
-        logger.info("Piper TTS verified: %s", self.piper_model_path)
-
-        # ── MQTT client ──
+        # ── MQTT client (connect early for state reporting) ──
         self.mqtt = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
             client_id="qbc_ai",
@@ -137,19 +108,100 @@ class AiService:
             json.dumps({"status": "offline"}),
             qos=1, retain=True,
         )
+        self.mqtt.connect(broker, port)
+        self.mqtt.loop_start()
 
-        # ── Feature handlers ──
-        from voice_handler import VoiceHandler
-        from exploration_handler import ExplorationHandler
+        try:
+            # ── 1. LLM server (axllm) ──
+            self._publish_current_state("loading_llm")
+            if not self._ensure_server():
+                self._publish_error("LLM server unavailable")
+                raise RuntimeError("LLM server unavailable — cannot start AI service")
 
-        self._handlers = [
-            VoiceHandler(self),
-            ExplorationHandler(self),
-        ]
-        for h in self._handlers:
-            h.register_callbacks(self.mqtt)
+            self.llm = OpenAI(api_key="not-needed", base_url=api_url)
 
-        logger.info("AI service ready — %d handler(s) loaded", len(self._handlers))
+            # ── 2. Whisper STT ──
+            self._publish_current_state("loading_stt")
+            logger.info(
+                "Loading Whisper: %s (device=%s, compute=%s)",
+                whisper_model_size, whisper_device, whisper_compute_type,
+            )
+            self.whisper = WhisperModel(
+                whisper_model_size,
+                device=whisper_device,
+                compute_type=whisper_compute_type,
+            )
+            logger.info("Whisper model loaded")
+
+            # ── 3. Piper TTS — validate ──
+            self._publish_current_state("validating_tts")
+            if not os.path.isfile(self.piper_model_path):
+                self._publish_error("Piper model not found")
+                raise FileNotFoundError(
+                    f"Piper voice model not found: {self.piper_model_path}\n"
+                    "Download with:\n"
+                    "  cd qBc_Ai/piper_models\n"
+                    "  wget https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+                    "en/en_US/lessac/medium/en_US-lessac-medium.onnx\n"
+                    "  wget https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+                    "en/en_US/lessac/medium/en_US-lessac-medium.onnx.json"
+                )
+            piper_config = self.piper_model_path + ".json"
+            if not os.path.isfile(piper_config):
+                self._publish_error("Piper config not found")
+                raise FileNotFoundError(f"Piper config not found: {piper_config}")
+            logger.info("Piper TTS verified: %s", self.piper_model_path)
+
+            # ── Feature handlers ──
+            from voice_handler import VoiceHandler
+            from exploration_handler import ExplorationHandler
+
+            self._handlers = [
+                VoiceHandler(self),
+                ExplorationHandler(self),
+            ]
+            for h in self._handlers:
+                h.register_callbacks(self.mqtt)
+            for h in self._handlers:
+                h.subscribe(self.mqtt)
+            for h in self._handlers:
+                h.publish_state()
+
+            self._publish_current_state("ready")
+            logger.info("AI service ready — %d handler(s) loaded", len(self._handlers))
+
+        except Exception:
+            self.mqtt.loop_stop()
+            self.mqtt.disconnect()
+            raise
+
+    # ------------------------------------------------------------------
+    # State / error publishing
+    # ------------------------------------------------------------------
+
+    def _publish_current_state(self, state):
+        """Publish current_state topic (retained)."""
+        self._current_state = state
+        self.mqtt.publish(TOPIC_CURRENT_STATE, state, qos=1, retain=True)
+
+    def _publish_error(self, error):
+        """Publish error_info topic (retained)."""
+        self._error_info = error
+        self.mqtt.publish(TOPIC_ERROR_INFO, error, qos=1, retain=True)
+
+    def set_handler_state(self, handler_name, state):
+        """Called by handlers to update the service's current_state."""
+        if state == "idle":
+            self._publish_current_state("ready")
+        else:
+            self._publish_current_state(f"{handler_name}:{state}")
+
+    def set_handler_error(self, handler_name, error):
+        """Called by handlers to report an error."""
+        if error is None:
+            self._publish_error("E_OK")
+        else:
+            self._publish_error(f"{handler_name}: {error}"[:100])
 
     # ------------------------------------------------------------------
     # Shared utilities for handlers
@@ -308,6 +360,8 @@ class AiService:
             json.dumps({"status": "online"}),
             qos=1, retain=True,
         )
+        client.publish(TOPIC_CURRENT_STATE, self._current_state, qos=1, retain=True)
+        client.publish(TOPIC_ERROR_INFO, self._error_info, qos=1, retain=True)
         for h in self._handlers:
             h.publish_state()
 
@@ -321,8 +375,7 @@ class AiService:
 
     def run(self):
         self._running = True
-        self.mqtt.connect(self.broker, self.port)
-        self.mqtt.loop_start()
+        # MQTT already connected in __init__
 
         logger.info("qBc_Ai service running on MQTT %s:%d", self.broker, self.port)
 
@@ -335,12 +388,14 @@ class AiService:
             stop.wait(1.0)
 
         logger.info("Shutting down...")
+        self._publish_current_state("shutting_down")
         self._running = False
         self.mqtt.publish(
             TOPIC_STATE,
             json.dumps({"status": "offline"}),
             qos=1, retain=True,
         )
+        self._publish_current_state("offline")
         for h in self._handlers:
             h.shutdown()
         self.mqtt.loop_stop()

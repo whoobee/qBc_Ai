@@ -94,9 +94,11 @@ class VoiceHandler:
                 return
             self._processing = True
         self.publish_state()
+        self._svc.set_handler_error("voice", None)
 
         try:
             # 1. Transcribe
+            self._svc.set_handler_state("voice", "transcribing")
             logger.info("Transcribing: %s", recording_path)
             text = self._transcribe(recording_path)
             if not text or not text.strip():
@@ -105,18 +107,22 @@ class VoiceHandler:
             logger.info("Transcription: %s", text)
 
             # 2. Query LLM
+            self._svc.set_handler_state("voice", "querying_llm")
             logger.info("Querying LLM...")
             response = self._query_llm(text)
             if not response or not response.strip():
                 logger.warning("Empty LLM response")
+                self._svc.set_handler_error("voice", "empty LLM response")
                 return
             logger.info("LLM response: %s", response)
 
             # 3. Synthesize speech
+            self._svc.set_handler_state("voice", "synthesizing")
             logger.info("Synthesizing speech...")
             audio_filename = self._svc.synthesize(response, prefix="voice")
             if not audio_filename:
                 logger.error("TTS synthesis failed")
+                self._svc.set_handler_error("voice", "TTS synthesis failed")
                 return
 
             # 4. Play
@@ -125,10 +131,12 @@ class VoiceHandler:
 
         except Exception as e:
             logger.error("Voice pipeline error: %s", e, exc_info=True)
+            self._svc.set_handler_error("voice", str(e)[:80])
         finally:
             with self._lock:
                 self._processing = False
             self.publish_state()
+            self._svc.set_handler_state("voice", "idle")
 
     def _transcribe(self, audio_path):
         """Transcribe audio file using faster-whisper."""
