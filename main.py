@@ -56,7 +56,7 @@ TOPIC_HEARTBEAT = "robot/system/heartbeat/ai"
 TOPIC_CURRENT_STATE = "robot/ai/current_state"
 TOPIC_ERROR_INFO = "robot/ai/error_info"
 
-PLAYBACK_VOLUME = 20
+PLAYBACK_VOLUME = 50
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _PROGRESS_RE = re.compile(r"(\d+)%\s*\|")
