@@ -152,6 +152,11 @@ class AiService:
                 raise FileNotFoundError(f"Piper config not found: {piper_config}")
             logger.info("Piper TTS verified: %s", self.piper_model_path)
 
+            # ── 4. MCP Tool Server ──
+            from mcp_server import McpServer
+            self.mcp = McpServer()
+            logger.info("MCP Tool Server loaded with %d tools", len(self.mcp.get_tools_schema()))
+
             # ── Feature handlers ──
             from voice_handler import VoiceHandler
             from exploration_handler import ExplorationHandler

@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import threading
+import time
 
 logger = logging.getLogger("qBc_Ai.voice")
 
@@ -20,6 +21,8 @@ TOPIC_STATE = "robot/ai/voice/state"
 
 SYSTEM_PROMPT = (
     "You are qB, a friendly and helpful robot companion. "
+    "You MUST use the provided tools to fetch the time or the weather if asked. "
+    "Do not answer without using the tools if you need that information. "
     "Give short, natural, conversational responses. "
     "Keep answers to 1-3 sentences unless more detail is needed. "
     "Do NOT use <think> tags or output internal reasoning."
@@ -129,6 +132,23 @@ class VoiceHandler:
             self._svc.publish_audio(audio_filename)
             logger.info("Playback command sent")
 
+            # 5. Check if it's a question, re-trigger mic if so
+            if response.strip().endswith("?"):
+                try:
+                    import wave
+                    from pathlib import Path
+                    playback_dir = Path(__file__).parent.parent / "qBc_Audio" / "resources" / "playback"
+                    wav_path = playback_dir / audio_filename
+                    with wave.open(str(wav_path), 'rb') as wf:
+                        duration = wf.getnframes() / float(wf.getframerate())
+                    
+                    logger.info("Question detected. Waiting %.1fs to re-trigger microphone...", duration)
+                    time.sleep(duration + 0.5)
+                    self._svc.mqtt.publish("robot/audio/cmd", json.dumps({"command": "record"}), qos=1)
+                    logger.info("Microphone re-triggered for conversational continuation.")
+                except Exception as e:
+                    logger.error("Failed to re-trigger microphone: %s", e)
+
         except Exception as e:
             logger.error("Voice pipeline error: %s", e, exc_info=True)
             self._svc.set_handler_error("voice", str(e)[:80])
@@ -155,13 +175,40 @@ class VoiceHandler:
 
     def _query_llm(self, user_text):
         """Send transcribed text to LLM and return the response."""
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_text},
+        ]
+        
         response = self._svc.llm.chat.completions.create(
             model=self._svc.model_name,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_text},
-            ],
+            messages=messages,
+            tools=self._svc.mcp.get_tools_schema(),
             max_tokens=256,
         )
-        text = response.choices[0].message.content
+        
+        message = response.choices[0].message
+        
+        if message.tool_calls:
+            # We must serialize the message correctly for the next request.
+            messages.append(message.model_dump(exclude_unset=True))
+            for tool_call in message.tool_calls:
+                result = self._svc.mcp.execute_tool(
+                    tool_call.function.name, 
+                    tool_call.function.arguments
+                )
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result
+                })
+                
+            response = self._svc.llm.chat.completions.create(
+                model=self._svc.model_name,
+                messages=messages,
+                max_tokens=256,
+            )
+            message = response.choices[0].message
+
+        text = message.content or ""
         return self._svc.strip_think_tags(text)
