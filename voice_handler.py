@@ -98,6 +98,7 @@ class VoiceHandler:
             self._processing = True
         self.publish_state()
         self._svc.set_handler_error("voice", None)
+        t0 = time.monotonic()
 
         try:
             # 1. Transcribe
@@ -112,12 +113,21 @@ class VoiceHandler:
             # 2. Query LLM
             self._svc.set_handler_state("voice", "querying_llm")
             logger.info("Querying LLM...")
-            response = self._query_llm(text)
+            response, tools_used = self._query_llm(text)
             if not response or not response.strip():
                 logger.warning("Empty LLM response")
                 self._svc.set_handler_error("voice", "empty LLM response")
                 return
             logger.info("LLM response: %s", response)
+
+            # Publish transcript for debug viewer
+            self._svc.publish_transcript({
+                "type": "voice",
+                "prompt": text,
+                "response": response,
+                "tools": tools_used,
+                "duration_ms": int((time.monotonic() - t0) * 1000),
+            })
 
             # 3. Synthesize speech
             self._svc.set_handler_state("voice", "synthesizing")
@@ -132,7 +142,8 @@ class VoiceHandler:
             self._svc.publish_audio(audio_filename)
             logger.info("Playback command sent")
 
-            # 5. Check if it's a question, re-trigger mic if so
+            # 5. If the response is a question, wait for playback to finish
+            #    then clear the trigger so wake-word detection resumes immediately
             if response.strip().endswith("?"):
                 try:
                     import wave
@@ -141,13 +152,18 @@ class VoiceHandler:
                     wav_path = playback_dir / audio_filename
                     with wave.open(str(wav_path), 'rb') as wf:
                         duration = wf.getnframes() / float(wf.getframerate())
-                    
-                    logger.info("Question detected. Waiting %.1fs to re-trigger microphone...", duration)
+
+                    logger.info("Question detected. Waiting %.1fs for playback...", duration)
                     time.sleep(duration + 0.5)
-                    self._svc.mqtt.publish("robot/audio/cmd", json.dumps({"command": "record"}), qos=1)
-                    logger.info("Microphone re-triggered for conversational continuation.")
+                    # Clear trigger so wake-word listening resumes cleanly
+                    self._svc.mqtt.publish(
+                        "robot/audio/cmd",
+                        json.dumps({"command": "clear_trigger"}),
+                        qos=1,
+                    )
+                    logger.info("Trigger cleared — wake word listening resumed.")
                 except Exception as e:
-                    logger.error("Failed to re-trigger microphone: %s", e)
+                    logger.error("Failed to clear trigger: %s", e)
 
         except Exception as e:
             logger.error("Voice pipeline error: %s", e, exc_info=True)
@@ -166,7 +182,7 @@ class VoiceHandler:
 
         segments, _info = self._svc.whisper.transcribe(
             audio_path,
-            language="en",
+            language=self._svc.whisper_language,
             beam_size=5,
             vad_filter=True,
         )
@@ -174,27 +190,35 @@ class VoiceHandler:
         return text.strip()
 
     def _query_llm(self, user_text):
-        """Send transcribed text to LLM and return the response."""
+        """Send transcribed text to LLM and return (response_text, tools_used)."""
+        # Build system prompt with optional language instruction
+        prompt = SYSTEM_PROMPT
+        lang_instr = self._svc.language_instruction
+        if lang_instr:
+            prompt = f"{prompt} {lang_instr}"
+
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": prompt},
             {"role": "user", "content": user_text},
         ]
-        
+
         response = self._svc.llm.chat.completions.create(
             model=self._svc.model_name,
             messages=messages,
             tools=self._svc.mcp.get_tools_schema(),
             max_tokens=256,
         )
-        
+
         message = response.choices[0].message
-        
+        tools_used = []
+
         if message.tool_calls:
+            tools_used = [tc.function.name for tc in message.tool_calls]
             # We must serialize the message correctly for the next request.
             messages.append(message.model_dump(exclude_unset=True))
             for tool_call in message.tool_calls:
                 result = self._svc.mcp.execute_tool(
-                    tool_call.function.name, 
+                    tool_call.function.name,
                     tool_call.function.arguments
                 )
                 messages.append({
@@ -202,7 +226,7 @@ class VoiceHandler:
                     "tool_call_id": tool_call.id,
                     "content": result
                 })
-                
+
             response = self._svc.llm.chat.completions.create(
                 model=self._svc.model_name,
                 messages=messages,
@@ -211,4 +235,4 @@ class VoiceHandler:
             message = response.choices[0].message
 
         text = message.content or ""
-        return self._svc.strip_think_tags(text)
+        return self._svc.strip_think_tags(text), tools_used

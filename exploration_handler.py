@@ -143,6 +143,7 @@ class ExplorationHandler:
             self._processing = True
         self.publish_state()
         self._svc.set_handler_error("explore", None)
+        t0 = time.monotonic()
 
         try:
             # 1. Request frame capture
@@ -208,7 +209,17 @@ class ExplorationHandler:
             else:
                 logger.warning("No valid waypoints parsed from VLM response")
 
-            # 5. Publish result (includes both waypoints and narration)
+            # 5. Publish transcript for debug viewer
+            self._svc.publish_transcript({
+                "type": "exploration",
+                "prompt": "Visual exploration",
+                "response": narration,
+                "waypoints": waypoints,
+                "frame": frame_path,
+                "duration_ms": int((time.monotonic() - t0) * 1000),
+            })
+
+            # 6. Publish result (includes both waypoints and narration)
             self._svc.mqtt.publish(
                 TOPIC_EXPLORE_RESULT,
                 json.dumps({
@@ -220,7 +231,7 @@ class ExplorationHandler:
                 qos=1,
             )
 
-            # 6. Synthesize narration
+            # 7. Synthesize narration
             self._svc.set_handler_state("explore", "synthesizing")
             logger.info("Synthesizing exploration narration...")
             audio_filename = self._svc.synthesize(narration, prefix="explore")
@@ -229,7 +240,7 @@ class ExplorationHandler:
                 self._svc.set_handler_error("explore", "TTS synthesis failed")
                 return
 
-            # 7. Play
+            # 8. Play
             self._svc.publish_audio(audio_filename)
             logger.info("Exploration narration sent for playback")
 
@@ -303,10 +314,16 @@ class ExplorationHandler:
 
     def _analyze_image(self, b64_image):
         """Send image to VLM for exploration analysis."""
+        # Build system prompt with optional language instruction for narration
+        prompt = SYSTEM_PROMPT
+        lang_instr = self._svc.language_instruction
+        if lang_instr:
+            prompt = f"{prompt}\n{lang_instr} The JSON waypoints must stay in English format, but write the narration in the requested language."
+
         messages = [
             {
                 "role": "system",
-                "content": [{"type": "text", "text": SYSTEM_PROMPT}],
+                "content": [{"type": "text", "text": prompt}],
             },
             {
                 "role": "user",

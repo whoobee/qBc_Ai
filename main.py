@@ -55,10 +55,35 @@ TOPIC_STATE = "robot/ai/state"
 TOPIC_HEARTBEAT = "robot/system/heartbeat/ai"
 TOPIC_CURRENT_STATE = "robot/ai/current_state"
 TOPIC_ERROR_INFO = "robot/ai/error_info"
+TOPIC_TRANSCRIPT = "robot/ai/transcript"
 
 PLAYBACK_VOLUME = 50  # default, overridden by MQTT settings
 
 TOPIC_SETTINGS_AUDIO = "robot/settings/audio"
+TOPIC_SETTINGS_AI = "robot/settings/ai"
+
+# ── Language configuration ──
+# Maps language code → Whisper language, Piper model filename, LLM instruction
+LANGUAGE_CONFIG = {
+    "en": {
+        "whisper": "en",
+        "piper_model": "en_US-lessac-medium.onnx",
+        "name": "English",
+        "instruction": "",
+    },
+    "ro": {
+        "whisper": "ro",
+        "piper_model": "ro_RO-mihai-medium.onnx",
+        "name": "Romanian",
+        "instruction": "You MUST respond in Romanian (limba romana).",
+    },
+    "de": {
+        "whisper": "de",
+        "piper_model": "de_DE-thorsten-medium.onnx",
+        "name": "German",
+        "instruction": "You MUST respond in German (Deutsch).",
+    },
+}
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _PROGRESS_RE = re.compile(r"(\d+)%\s*\|")
@@ -101,6 +126,10 @@ class AiService:
         # Volume settings (updated dynamically via MQTT)
         self._global_volume = 100
         self._ai_reply_volume = PLAYBACK_VOLUME
+
+        # Language settings (updated dynamically via MQTT)
+        self._language = "en"
+        self._piper_models_dir = SCRIPT_DIR / "piper_models"
 
         # ── MQTT client (connect early for state reporting) ──
         self.mqtt = mqtt.Client(
@@ -264,6 +293,47 @@ class AiService:
         """Compute effective AI reply volume: ai_reply_volume * global_volume / 100."""
         return round(self._ai_reply_volume * self._global_volume / 100)
 
+    def publish_transcript(self, data):
+        """Publish an AI transcript event for the debug viewer."""
+        data.setdefault("timestamp", time.time())
+        self.mqtt.publish(
+            TOPIC_TRANSCRIPT,
+            json.dumps(data),
+            qos=1,
+        )
+
+    @property
+    def whisper_language(self):
+        """Current Whisper STT language code (e.g. 'en', 'ro', 'de')."""
+        return LANGUAGE_CONFIG.get(self._language, LANGUAGE_CONFIG["en"])["whisper"]
+
+    @property
+    def language_instruction(self):
+        """LLM instruction for the current language (empty for English)."""
+        return LANGUAGE_CONFIG.get(self._language, LANGUAGE_CONFIG["en"])["instruction"]
+
+    def get_piper_model_for_language(self, lang=None):
+        """Return Piper model path for a language. Falls back to default if missing."""
+        lang = lang or self._language
+        cfg = LANGUAGE_CONFIG.get(lang, LANGUAGE_CONFIG["en"])
+        model_path = self._piper_models_dir / cfg["piper_model"]
+        if model_path.is_file():
+            return str(model_path)
+        logger.warning("Piper model not found for '%s': %s — using default", lang, model_path)
+        return self.piper_model_path  # fall back to the one validated at startup
+
+    def _apply_language(self, lang):
+        """Switch language at runtime (called from MQTT settings handler)."""
+        if lang not in LANGUAGE_CONFIG:
+            logger.warning("Unknown language code: %s — ignoring", lang)
+            return
+        old = self._language
+        self._language = lang
+        new_model = self.get_piper_model_for_language(lang)
+        if new_model != self.piper_model_path:
+            self.piper_model_path = new_model
+        logger.info("Language switched: %s → %s (piper=%s)", old, lang, self.piper_model_path)
+
     def publish_audio(self, filename, volume=None):
         """Send playback command to qBc_Audio."""
         if volume is None:
@@ -368,8 +438,9 @@ class AiService:
             return
         logger.info("Connected to MQTT broker %s:%d", self.broker, self.port)
 
-        # Subscribe to volume settings
+        # Subscribe to settings
         client.subscribe(TOPIC_SETTINGS_AUDIO, qos=1)
+        client.subscribe(TOPIC_SETTINGS_AI, qos=1)
 
         # Subscribe handler topics
         for h in self._handlers:
@@ -397,6 +468,14 @@ class AiService:
                             self._global_volume, self._ai_reply_volume)
             except Exception as e:
                 logger.warning("Failed to parse audio settings: %s", e)
+        elif msg.topic == TOPIC_SETTINGS_AI:
+            try:
+                data = json.loads(msg.payload)
+                lang = data.get("language")
+                if lang and lang != self._language:
+                    self._apply_language(lang)
+            except Exception as e:
+                logger.warning("Failed to parse AI settings: %s", e)
 
     def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
         if reason_code.is_failure:
