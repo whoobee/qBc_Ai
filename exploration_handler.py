@@ -13,6 +13,7 @@ import io
 import json
 import logging
 import os
+import re
 import threading
 import time
 
@@ -23,20 +24,32 @@ logger = logging.getLogger("qBc_Ai.explore")
 TOPIC_EXPLORE_CMD = "robot/ai/explore/cmd"
 TOPIC_EXPLORE_STATE = "robot/ai/explore/state"
 TOPIC_EXPLORE_RESULT = "robot/ai/explore/result"
+TOPIC_NAV_WAYPOINTS = "robot/navigation/waypoints"
 TOPIC_VISION_CMD = "robot/vision/cmd"
 TOPIC_FRAME_READY = "robot/vision/frame_ready"
 
 SYSTEM_PROMPT = (
-    "You are qB, a curious and adventurous robot companion exploring your surroundings. "
-    "You love discovering new things and are always excited about what you see. "
-    "Do NOT use <think> tags or output internal reasoning."
+    "You are qB, a curious robot exploring your surroundings. "
+    "Always respond in EXACTLY this format:\n"
+    "Line 1: A JSON object with waypoints\n"
+    "Line 2: ---\n"
+    "Line 3+: Your narration\n"
+    "Do NOT use <think> tags."
 )
 
 EXPLORE_PROMPT = (
     "Look at this image from my camera. "
-    "Describe what you see, point out anything interesting, "
-    "and suggest what I should explore or look at next. "
-    "Be curious and enthusiastic! Keep it to 2-3 sentences."
+    "Pick a point you want to explore and create 2-5 waypoints to get there, "
+    "avoiding obstacles. Waypoints are in image coordinates where (0,0) is top-left "
+    "and (1,1) is bottom-right. x is horizontal, y is vertical.\n\n"
+    "Respond in EXACTLY this format (JSON on first line, then ---, then narration):\n"
+    '{"waypoints": [{"x": 0.5, "y": 0.8}, {"x": 0.5, "y": 0.4}]}\n'
+    "---\n"
+    "I see a hallway ahead and I want to explore it!"
+)
+
+_WAYPOINT_JSON_RE = re.compile(
+    r'\{\s*"waypoints"\s*:\s*\[.*?\]\s*\}', re.DOTALL
 )
 
 ENCODE_SIZE = (384, 384)
@@ -169,18 +182,38 @@ class ExplorationHandler:
             # 4. Analyze with VLM
             self._svc.set_handler_state("explore", "analyzing")
             logger.info("Analyzing image with VLM...")
-            analysis = self._analyze_image(b64)
-            if not analysis or not analysis.strip():
+            raw_analysis = self._analyze_image(b64)
+            if not raw_analysis or not raw_analysis.strip():
                 logger.warning("Empty analysis result")
                 self._svc.set_handler_error("explore", "empty VLM analysis")
                 return
-            logger.info("Exploration analysis: %s", analysis)
+            logger.info("Raw VLM response: %s", raw_analysis)
 
-            # 5. Publish result
+            # 4b. Parse waypoints and narration
+            waypoints, narration = self._parse_vlm_response(raw_analysis)
+            logger.info("Parsed %d waypoints, narration: %s", len(waypoints), narration[:80])
+
+            # 4c. Publish waypoints for navigation service
+            if waypoints:
+                self._svc.mqtt.publish(
+                    TOPIC_NAV_WAYPOINTS,
+                    json.dumps({
+                        "waypoints": waypoints,
+                        "frame": frame_path,
+                        "timestamp": time.time(),
+                    }),
+                    qos=1,
+                )
+                logger.info("Published %d waypoints to %s", len(waypoints), TOPIC_NAV_WAYPOINTS)
+            else:
+                logger.warning("No valid waypoints parsed from VLM response")
+
+            # 5. Publish result (includes both waypoints and narration)
             self._svc.mqtt.publish(
                 TOPIC_EXPLORE_RESULT,
                 json.dumps({
-                    "analysis": analysis,
+                    "analysis": narration,
+                    "waypoints": waypoints,
                     "frame": frame_path,
                     "timestamp": time.time(),
                 }),
@@ -190,7 +223,7 @@ class ExplorationHandler:
             # 6. Synthesize narration
             self._svc.set_handler_state("explore", "synthesizing")
             logger.info("Synthesizing exploration narration...")
-            audio_filename = self._svc.synthesize(analysis, prefix="explore")
+            audio_filename = self._svc.synthesize(narration, prefix="explore")
             if not audio_filename:
                 logger.error("TTS synthesis failed")
                 self._svc.set_handler_error("explore", "TTS synthesis failed")
@@ -222,6 +255,52 @@ class ExplorationHandler:
             logger.error("Image encoding error: %s", e)
             return None
 
+    def _parse_vlm_response(self, text):
+        """Parse VLM response into (waypoints_list, narration_text).
+
+        Expected format: JSON on first line, '---' separator, then narration.
+        Falls back to regex extraction if format doesn't match.
+        Returns ([], full_text) on parse failure so TTS still works.
+        """
+        waypoints = []
+        narration = text
+
+        # Try splitting on --- separator first
+        parts = text.split("---", 1)
+        json_part = parts[0].strip()
+        if len(parts) > 1:
+            narration = parts[1].strip()
+
+        # Try parsing JSON from the first part
+        parsed = None
+        try:
+            parsed = json.loads(json_part)
+        except (json.JSONDecodeError, ValueError):
+            # Fallback: regex search in the full text
+            m = _WAYPOINT_JSON_RE.search(text)
+            if m:
+                try:
+                    parsed = json.loads(m.group())
+                    # Remove JSON from narration
+                    narration = text[:m.start()].strip(" \n") + " " + text[m.end():].strip(" \n")
+                    narration = narration.replace("---", "").strip()
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+        if parsed and isinstance(parsed.get("waypoints"), list):
+            for wp in parsed["waypoints"]:
+                if isinstance(wp, dict):
+                    x = wp.get("x")
+                    y = wp.get("y")
+                    if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+                        if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
+                            waypoints.append({"x": float(x), "y": float(y)})
+
+        if not narration or not narration.strip():
+            narration = text
+
+        return waypoints, narration.strip()
+
     def _analyze_image(self, b64_image):
         """Send image to VLM for exploration analysis."""
         messages = [
@@ -246,7 +325,7 @@ class ExplorationHandler:
         response = self._svc.llm.chat.completions.create(
             model=self._svc.model_name,
             messages=messages,
-            max_tokens=256,
+            max_tokens=384,
         )
         text = response.choices[0].message.content
         return self._svc.strip_think_tags(text)

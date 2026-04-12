@@ -56,7 +56,9 @@ TOPIC_HEARTBEAT = "robot/system/heartbeat/ai"
 TOPIC_CURRENT_STATE = "robot/ai/current_state"
 TOPIC_ERROR_INFO = "robot/ai/error_info"
 
-PLAYBACK_VOLUME = 50
+PLAYBACK_VOLUME = 50  # default, overridden by MQTT settings
+
+TOPIC_SETTINGS_AUDIO = "robot/settings/audio"
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _PROGRESS_RE = re.compile(r"(\d+)%\s*\|")
@@ -96,6 +98,10 @@ class AiService:
         self._error_info = "E_OK"
         self._handlers = []
 
+        # Volume settings (updated dynamically via MQTT)
+        self._global_volume = 100
+        self._ai_reply_volume = PLAYBACK_VOLUME
+
         # ── MQTT client (connect early for state reporting) ──
         self.mqtt = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
@@ -103,6 +109,7 @@ class AiService:
         )
         self.mqtt.on_connect = self._on_connect
         self.mqtt.on_disconnect = self._on_disconnect
+        self.mqtt.on_message = self._on_message
         self.mqtt.will_set(
             TOPIC_STATE,
             json.dumps({"status": "offline"}),
@@ -253,8 +260,14 @@ class AiService:
             )
             return None
 
-    def publish_audio(self, filename, volume=PLAYBACK_VOLUME):
+    def get_effective_ai_volume(self):
+        """Compute effective AI reply volume: ai_reply_volume * global_volume / 100."""
+        return round(self._ai_reply_volume * self._global_volume / 100)
+
+    def publish_audio(self, filename, volume=None):
         """Send playback command to qBc_Audio."""
+        if volume is None:
+            volume = self.get_effective_ai_volume()
         self.mqtt.publish(
             "robot/audio/play",
             json.dumps({"file": filename, "volume": volume, "voice": True}),
@@ -355,6 +368,9 @@ class AiService:
             return
         logger.info("Connected to MQTT broker %s:%d", self.broker, self.port)
 
+        # Subscribe to volume settings
+        client.subscribe(TOPIC_SETTINGS_AUDIO, qos=1)
+
         # Subscribe handler topics
         for h in self._handlers:
             h.subscribe(client)
@@ -369,6 +385,18 @@ class AiService:
         client.publish(TOPIC_ERROR_INFO, self._error_info, qos=1, retain=True)
         for h in self._handlers:
             h.publish_state()
+
+    def _on_message(self, client, userdata, msg):
+        """Handle messages not matched by per-topic callbacks."""
+        if msg.topic == TOPIC_SETTINGS_AUDIO:
+            try:
+                data = json.loads(msg.payload)
+                self._global_volume = int(data.get("global_volume", self._global_volume))
+                self._ai_reply_volume = int(data.get("ai_reply_volume", self._ai_reply_volume))
+                logger.info("Volume settings updated: global=%d, ai_reply=%d",
+                            self._global_volume, self._ai_reply_volume)
+            except Exception as e:
+                logger.warning("Failed to parse audio settings: %s", e)
 
     def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
         if reason_code.is_failure:
