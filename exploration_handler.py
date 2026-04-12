@@ -19,6 +19,8 @@ import time
 
 from PIL import Image
 
+from floor_detector import detect_floor_boundary
+
 logger = logging.getLogger("qBc_Ai.explore")
 
 TOPIC_EXPLORE_CMD = "robot/ai/explore/cmd"
@@ -38,12 +40,17 @@ SYSTEM_PROMPT = (
 )
 
 _EXPLORE_PROMPT_BASE = (
-    "Look at this image from my camera. "
-    "Pick a point you want to explore and create 2-5 waypoints to get there, "
-    "avoiding obstacles. Waypoints are in image coordinates where (0,0) is top-left "
+    "Look at this image from my camera. I am a small ground robot on wheels. "
+    "I can only drive on the FLOOR — I cannot fly, climb, or jump.\n\n"
+    "Pick a point on the floor you want to explore and create 2-5 waypoints "
+    "to drive there, avoiding obstacles. "
+    "IMPORTANT: All waypoints MUST be on the floor surface. "
+    "The floor is in the BOTTOM half of the image (y > 0.5). "
+    "Never place waypoints on walls, shelves, furniture tops, or in the air. "
+    "Waypoints are in image coordinates where (0,0) is top-left "
     "and (1,1) is bottom-right. x is horizontal, y is vertical.\n\n"
     "Respond in EXACTLY this format (JSON on first line, then ---, then narration):\n"
-    '{"waypoints": [{"x": 0.5, "y": 0.8}, {"x": 0.5, "y": 0.4}]}\n'
+    '{"waypoints": [{"x": 0.5, "y": 0.85}, {"x": 0.4, "y": 0.65}]}\n'
     "---\n"
 )
 
@@ -60,8 +67,9 @@ def _build_explore_prompt(language="en"):
     example = _EXPLORE_EXAMPLES.get(language, _EXPLORE_EXAMPLES["en"])
     return _EXPLORE_PROMPT_BASE + example
 
-_WAYPOINT_JSON_RE = re.compile(
-    r'\{\s*"waypoints"\s*:\s*\[.*?\]\s*\}', re.DOTALL
+# Extract just the waypoints array — robust against malformed outer JSON
+_WAYPOINT_ARRAY_RE = re.compile(
+    r'"waypoints"\s*:\s*(\[.*?\])', re.DOTALL
 )
 
 ENCODE_SIZE = (384, 384)
@@ -86,6 +94,9 @@ class ExplorationHandler:
         self._waiting_for_frame = False
         self._frame_path = None
         self._frame_event = threading.Event()
+
+        # Dynamic floor boundary (updated per exploration from camera frame)
+        self._floor_boundary = 0.4
 
     def register_callbacks(self, client):
         """Register per-topic MQTT callbacks (called once at init)."""
@@ -185,14 +196,17 @@ class ExplorationHandler:
                 return
             logger.info("Frame received: %s", frame_path)
 
-            # 3. Encode image for VLM
+            # 3. Detect floor boundary for waypoint validation
+            self._floor_boundary = detect_floor_boundary(frame_path)
+
+            # 4. Encode image for VLM
             b64 = self._encode_image(frame_path)
             if not b64:
                 logger.error("Failed to encode image")
                 self._svc.set_handler_error("explore", "image encoding failed")
                 return
 
-            # 4. Analyze with VLM
+            # 5. Analyze with VLM
             self._svc.set_handler_state("explore", "analyzing")
             logger.info("Analyzing image with VLM...")
             raw_analysis = self._analyze_image(b64)
@@ -202,17 +216,18 @@ class ExplorationHandler:
                 return
             logger.info("Raw VLM response: %s", raw_analysis)
 
-            # 4b. Parse waypoints and narration
+            # 5b. Parse waypoints and narration
             waypoints, narration = self._parse_vlm_response(raw_analysis)
             logger.info("Parsed %d waypoints, narration: %s", len(waypoints), narration[:80])
 
-            # 4c. Publish waypoints for navigation service
+            # 5c. Publish waypoints for navigation service
             if waypoints:
                 self._svc.mqtt.publish(
                     TOPIC_NAV_WAYPOINTS,
                     json.dumps({
                         "waypoints": waypoints,
                         "frame": frame_path,
+                        "floor_boundary": self._floor_boundary,
                         "timestamp": time.time(),
                     }),
                     qos=1,
@@ -299,14 +314,21 @@ class ExplorationHandler:
         try:
             parsed = json.loads(json_part)
         except (json.JSONDecodeError, ValueError):
-            # Fallback: regex search in the full text
-            m = _WAYPOINT_JSON_RE.search(text)
+            # Fallback: extract the waypoints array directly via regex
+            # Handles malformed JSON like {"waypoints": [...], "---"}
+            m = _WAYPOINT_ARRAY_RE.search(text)
             if m:
                 try:
-                    parsed = json.loads(m.group())
-                    # Remove JSON from narration
-                    narration = text[:m.start()].strip(" \n") + " " + text[m.end():].strip(" \n")
-                    narration = narration.replace("---", "").strip()
+                    arr = json.loads(m.group(1))
+                    parsed = {"waypoints": arr}
+                    # Remove everything up to end of the match from narration
+                    after = text[m.end():].strip()
+                    # Strip residual JSON braces, separator
+                    after = after.lstrip("}").strip()
+                    if after.startswith("---"):
+                        after = after[3:].strip()
+                    if after:
+                        narration = after
                 except (json.JSONDecodeError, ValueError):
                     pass
 
@@ -317,6 +339,14 @@ class ExplorationHandler:
                     y = wp.get("y")
                     if isinstance(x, (int, float)) and isinstance(y, (int, float)):
                         if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
+                            # Reject waypoints above the detected floor boundary
+                            if y < self._floor_boundary:
+                                logger.warning(
+                                    "Discarding waypoint above floor boundary "
+                                    "(%.2f, %.2f) — floor starts at y=%.2f",
+                                    x, y, self._floor_boundary,
+                                )
+                                continue
                             waypoints.append({"x": float(x), "y": float(y)})
 
         if not narration or not narration.strip():

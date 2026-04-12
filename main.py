@@ -56,6 +56,7 @@ TOPIC_HEARTBEAT = "robot/system/heartbeat/ai"
 TOPIC_CURRENT_STATE = "robot/ai/current_state"
 TOPIC_ERROR_INFO = "robot/ai/error_info"
 TOPIC_TRANSCRIPT = "robot/ai/transcript"
+TOPIC_LOADING_PROGRESS = "robot/system/loading_progress"
 
 PLAYBACK_VOLUME = 50  # default, overridden by MQTT settings
 
@@ -148,16 +149,19 @@ class AiService:
         self.mqtt.loop_start()
 
         try:
-            # ── 1. LLM server (axllm) ──
+            # ── 1. LLM server (axllm) — dominates loading time ──
             self._publish_current_state("loading_llm")
+            self._publish_progress("loading_llm", 0, "Starting LLM server...")
             if not self._ensure_server():
                 self._publish_error("LLM server unavailable")
                 raise RuntimeError("LLM server unavailable — cannot start AI service")
 
             self.llm = OpenAI(api_key="not-needed", base_url=api_url)
+            self._publish_progress("loading_llm", 70, "LLM server ready")
 
             # ── 2. Whisper STT ──
             self._publish_current_state("loading_stt")
+            self._publish_progress("loading_stt", 72, "Loading speech recognition...")
             logger.info(
                 "Loading Whisper: %s (device=%s, compute=%s)",
                 whisper_model_size, whisper_device, whisper_compute_type,
@@ -168,9 +172,11 @@ class AiService:
                 compute_type=whisper_compute_type,
             )
             logger.info("Whisper model loaded")
+            self._publish_progress("loading_stt", 85, "Speech recognition ready")
 
             # ── 3. Piper TTS — validate ──
             self._publish_current_state("validating_tts")
+            self._publish_progress("validating_tts", 88, "Validating TTS...")
             if not os.path.isfile(self.piper_model_path):
                 self._publish_error("Piper model not found")
                 raise FileNotFoundError(
@@ -189,11 +195,13 @@ class AiService:
             logger.info("Piper TTS verified: %s", self.piper_model_path)
 
             # ── 4. MCP Tool Server ──
+            self._publish_progress("loading_tools", 90, "Loading tool server...")
             from mcp_server import McpServer
             self.mcp = McpServer()
             logger.info("MCP Tool Server loaded with %d tools", len(self.mcp.get_tools_schema()))
 
             # ── Feature handlers ──
+            self._publish_progress("loading_handlers", 94, "Loading handlers...")
             from voice_handler import VoiceHandler
             from exploration_handler import ExplorationHandler
 
@@ -209,6 +217,7 @@ class AiService:
                 h.publish_state()
 
             self._publish_current_state("ready")
+            self._publish_progress("ready", 100, "AI service ready")
             logger.info("AI service ready — %d handler(s) loaded", len(self._handlers))
 
         except Exception:
@@ -229,6 +238,19 @@ class AiService:
         """Publish error_info topic (retained)."""
         self._error_info = error
         self.mqtt.publish(TOPIC_ERROR_INFO, error, qos=1, retain=True)
+
+    def _publish_progress(self, stage, percent, message=""):
+        """Publish loading progress for boot screen / dashboard."""
+        self.mqtt.publish(
+            TOPIC_LOADING_PROGRESS,
+            json.dumps({
+                "service": "ai",
+                "stage": stage,
+                "percent": min(100, max(0, int(percent))),
+                "message": message or stage,
+            }),
+            qos=0,
+        )
 
     def set_handler_state(self, handler_name, state):
         """Called by handlers to update the service's current_state."""
@@ -388,7 +410,14 @@ class AiService:
                     continue
                 m = _PROGRESS_RE.search(line)
                 if m:
-                    logger.info("Loading model: %s%%", m.group(1))
+                    pct = int(m.group(1))
+                    logger.info("Loading model: %s%%", pct)
+                    # Map axllm 0-100% to overall AI progress 0-68%
+                    overall = int(pct * 0.68)
+                    self._publish_progress(
+                        "loading_llm", overall,
+                        f"Loading LLM model: {pct}%",
+                    )
                 if "starting" in line.lower() and "server" in line.lower():
                     logger.info("LLM server ready")
                     server_ready.set()
