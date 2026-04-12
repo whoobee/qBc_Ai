@@ -37,7 +37,7 @@ SYSTEM_PROMPT = (
     "Do NOT use <think> tags."
 )
 
-EXPLORE_PROMPT = (
+_EXPLORE_PROMPT_BASE = (
     "Look at this image from my camera. "
     "Pick a point you want to explore and create 2-5 waypoints to get there, "
     "avoiding obstacles. Waypoints are in image coordinates where (0,0) is top-left "
@@ -45,8 +45,20 @@ EXPLORE_PROMPT = (
     "Respond in EXACTLY this format (JSON on first line, then ---, then narration):\n"
     '{"waypoints": [{"x": 0.5, "y": 0.8}, {"x": 0.5, "y": 0.4}]}\n'
     "---\n"
-    "I see a hallway ahead and I want to explore it!"
 )
+
+# Example narrations per language (the model tends to copy the example verbatim)
+_EXPLORE_EXAMPLES = {
+    "en": "I see a hallway ahead and I want to explore it!",
+    "ro": "Vad un hol in fata mea si vreau sa il explorez!",
+    "de": "Ich sehe einen Flur vor mir und moechte ihn erkunden!",
+}
+
+
+def _build_explore_prompt(language="en"):
+    """Build the exploration user prompt with a language-appropriate example."""
+    example = _EXPLORE_EXAMPLES.get(language, _EXPLORE_EXAMPLES["en"])
+    return _EXPLORE_PROMPT_BASE + example
 
 _WAYPOINT_JSON_RE = re.compile(
     r'\{\s*"waypoints"\s*:\s*\[.*?\]\s*\}', re.DOTALL
@@ -315,20 +327,23 @@ class ExplorationHandler:
     def _analyze_image(self, b64_image):
         """Send image to VLM for exploration analysis."""
         # Build system prompt with optional language instruction for narration
-        prompt = SYSTEM_PROMPT
+        sys_prompt = SYSTEM_PROMPT
         lang_instr = self._svc.language_instruction
         if lang_instr:
-            prompt = f"{prompt}\n{lang_instr} The JSON waypoints must stay in English format, but write the narration in the requested language."
+            sys_prompt = f"{sys_prompt}\n{lang_instr} The JSON waypoints must stay in English format, but write the narration in the requested language."
+
+        # Build user prompt with language-appropriate example narration
+        user_prompt = _build_explore_prompt(self._svc._language)
 
         messages = [
             {
                 "role": "system",
-                "content": [{"type": "text", "text": prompt}],
+                "content": [{"type": "text", "text": sys_prompt}],
             },
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": EXPLORE_PROMPT},
+                    {"type": "text", "text": user_prompt},
                     {
                         "type": "image_url",
                         "image_url": {
