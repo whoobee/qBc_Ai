@@ -2,12 +2,15 @@
 """
 qBc_Ai — Unified AI service for qB Companion.
 
-Manages the shared axllm VLM server and hosts modular AI feature handlers.
+Manages NPU-accelerated AI servers and hosts modular AI feature handlers.
 Each handler lives in its own file and registers MQTT topics via the service.
 
 Current features:
     - Voice assistant (voice_handler.py): STT → LLM → TTS
     - Visual exploration (exploration_handler.py): Camera → VLM → TTS
+
+All three inference stages (STT, LLM, TTS) are accessed via configurable HTTP
+endpoints, allowing them to run locally on the NPU or on a remote server.
 
 MQTT topics:
     Publish:
@@ -15,12 +18,13 @@ MQTT topics:
         robot/system/heartbeat/ai    Keepalive (1 Hz)
 
 Prerequisites:
-    pip install faster-whisper openai paho-mqtt Pillow
-    axllm binary in PATH
-    Piper TTS binary + voice model in piper_models/
+    pip install openai paho-mqtt Pillow
+    axllm binary in PATH (for local LLM mode)
+    whisper.axcl server (STT, default port 8801)
+    melotts.axcl server (TTS, default port 8802)
 
 Usage:
-    python3 main.py [--piper-model piper_models/en_US-lessac-medium.onnx]
+    python3 main.py [--stt-url http://127.0.0.1:8801] [--tts-url http://127.0.0.1:8802]
 """
 
 import argparse
@@ -28,6 +32,7 @@ import atexit
 import json
 import logging
 import os
+import base64
 import re
 import shutil
 import signal
@@ -38,17 +43,17 @@ import urllib.request
 from pathlib import Path
 
 import paho.mqtt.client as mqtt
-from faster_whisper import WhisperModel
 from openai import OpenAI
 
 logger = logging.getLogger("qBc_Ai")
 
 SCRIPT_DIR = Path(__file__).parent
 PLAYBACK_DIR = SCRIPT_DIR.parent / "qBc_Audio" / "resources" / "playback"
-DEFAULT_PIPER_MODEL = str(SCRIPT_DIR / "piper_models" / "en_US-lessac-medium.onnx")
-DEFAULT_MODEL_DIR = str(SCRIPT_DIR / "Qwen3.5-4B")
+DEFAULT_MODEL_DIR = str(SCRIPT_DIR / "models" / "Qwen3.5-4B")
 
-DEFAULT_API_URL = "http://127.0.0.1:8000/v1"
+DEFAULT_STT_URL = "http://127.0.0.1:8801"
+DEFAULT_LLM_URL = "http://127.0.0.1:8000/v1"
+DEFAULT_TTS_URL = "http://127.0.0.1:8802"
 DEFAULT_MODEL = "AXERA-TECH/Qwen3.5-4B-AX650-GPTQ-Int4-C128-P1152-CTX2047"
 
 TOPIC_STATE = "robot/ai/state"
@@ -64,23 +69,23 @@ TOPIC_SETTINGS_AUDIO = "robot/settings/audio"
 TOPIC_SETTINGS_AI = "robot/settings/ai"
 
 # ── Language configuration ──
-# Maps language code → Whisper language, Piper model filename, LLM instruction
+# Maps language code → STT language, TTS language code, LLM instruction
 LANGUAGE_CONFIG = {
     "en": {
-        "whisper": "en",
-        "piper_model": "en_US-lessac-medium.onnx",
+        "stt_lang": "en",
+        "tts_lang": "en",
         "name": "English",
         "instruction": "",
     },
     "ro": {
-        "whisper": "ro",
-        "piper_model": "ro_RO-mihai-medium.onnx",
+        "stt_lang": "ro",
+        "tts_lang": "ro",
         "name": "Romanian",
         "instruction": "You MUST respond in Romanian (limba romana).",
     },
     "de": {
-        "whisper": "de",
-        "piper_model": "de_DE-thorsten-medium.onnx",
+        "stt_lang": "de",
+        "tts_lang": "de",
         "name": "German",
         "instruction": "You MUST respond in German (Deutsch).",
     },
@@ -97,26 +102,19 @@ class AiService:
         self,
         broker="localhost",
         port=1883,
-        api_url=DEFAULT_API_URL,
+        stt_url=DEFAULT_STT_URL,
+        llm_url=DEFAULT_LLM_URL,
+        tts_url=DEFAULT_TTS_URL,
         model_name=DEFAULT_MODEL,
         model_dir=DEFAULT_MODEL_DIR,
-        whisper_model_size="tiny",
-        whisper_device="cpu",
-        whisper_compute_type="int8",
-        piper_model_path=DEFAULT_PIPER_MODEL,
-        piper_binary="piper",
     ):
         self.broker = broker
         self.port = port
-        self.api_url = api_url
+        self.stt_url = stt_url.rstrip("/")
+        self.llm_url = llm_url.rstrip("/")
+        self.tts_url = tts_url.rstrip("/")
         self.model_name = model_name
         self.model_dir = model_dir
-
-        piper_path = Path(piper_model_path)
-        if not piper_path.is_absolute():
-            piper_path = SCRIPT_DIR / piper_path
-        self.piper_model_path = str(piper_path.resolve())
-        self.piper_binary = piper_binary
 
         self._running = False
         self._axllm_proc = None
@@ -130,7 +128,6 @@ class AiService:
 
         # Language settings (updated dynamically via MQTT)
         self._language = "en"
-        self._piper_models_dir = SCRIPT_DIR / "piper_models"
 
         # ── MQTT client (connect early for state reporting) ──
         self.mqtt = mqtt.Client(
@@ -149,59 +146,51 @@ class AiService:
         self.mqtt.loop_start()
 
         try:
-            # ── 1. LLM server (axllm) — dominates loading time ──
+            # ── 1. LLM server ──
             self._publish_current_state("loading_llm")
             self._publish_progress("loading_llm", 0, "Starting LLM server...")
-            if not self._ensure_server():
+            if not self._wait_for_server(self.llm_url + "/models", "LLM",
+                                         timeout=180):
                 self._publish_error("LLM server unavailable")
                 raise RuntimeError("LLM server unavailable — cannot start AI service")
 
-            self.llm = OpenAI(api_key="not-needed", base_url=api_url)
+            self.llm = OpenAI(api_key="not-needed", base_url=llm_url)
             self._publish_progress("loading_llm", 70, "LLM server ready")
 
-            # ── 2. Whisper STT ──
+            # ── 2. STT server (whisper.axcl) ──
             self._publish_current_state("loading_stt")
-            self._publish_progress("loading_stt", 72, "Loading speech recognition...")
-            logger.info(
-                "Loading Whisper: %s (device=%s, compute=%s)",
-                whisper_model_size, whisper_device, whisper_compute_type,
-            )
-            self.whisper = WhisperModel(
-                whisper_model_size,
-                device=whisper_device,
-                compute_type=whisper_compute_type,
-            )
-            logger.info("Whisper model loaded")
+            self._publish_progress("loading_stt", 72, "Connecting to STT server...")
+            if not self._wait_for_server(self.stt_url + "/health", "STT",
+                                         timeout=120):
+                self._publish_error("STT server unavailable")
+                raise RuntimeError(
+                    f"STT server not reachable at {self.stt_url}\n"
+                    "Start whisper.axcl:  cd ~/whisper.axcl && bash serve.sh"
+                )
+            logger.info("STT server ready at %s", self.stt_url)
             self._publish_progress("loading_stt", 85, "Speech recognition ready")
 
-            # ── 3. Piper TTS — validate ──
-            self._publish_current_state("validating_tts")
-            self._publish_progress("validating_tts", 88, "Validating TTS...")
-            if not os.path.isfile(self.piper_model_path):
-                self._publish_error("Piper model not found")
-                raise FileNotFoundError(
-                    f"Piper voice model not found: {self.piper_model_path}\n"
-                    "Download with:\n"
-                    "  cd qBc_Ai/piper_models\n"
-                    "  wget https://huggingface.co/rhasspy/piper-voices/resolve/main/"
-                    "en/en_US/lessac/medium/en_US-lessac-medium.onnx\n"
-                    "  wget https://huggingface.co/rhasspy/piper-voices/resolve/main/"
-                    "en/en_US/lessac/medium/en_US-lessac-medium.onnx.json"
+            # ── 3. TTS server (melotts.axcl) ──
+            self._publish_current_state("loading_tts")
+            self._publish_progress("loading_tts", 88, "Connecting to TTS server...")
+            if not self._wait_for_server(self.tts_url + "/health", "TTS",
+                                         timeout=120):
+                self._publish_error("TTS server unavailable")
+                raise RuntimeError(
+                    f"TTS server not reachable at {self.tts_url}\n"
+                    "Start melotts.axcl:  cd ~/melotts.axcl && bash serve.sh"
                 )
-            piper_config = self.piper_model_path + ".json"
-            if not os.path.isfile(piper_config):
-                self._publish_error("Piper config not found")
-                raise FileNotFoundError(f"Piper config not found: {piper_config}")
-            logger.info("Piper TTS verified: %s", self.piper_model_path)
+            logger.info("TTS server ready at %s", self.tts_url)
+            self._publish_progress("loading_tts", 92, "TTS server ready")
 
             # ── 4. MCP Tool Server ──
-            self._publish_progress("loading_tools", 90, "Loading tool server...")
+            self._publish_progress("loading_tools", 94, "Loading tool server...")
             from mcp_server import McpServer
-            self.mcp = McpServer()
+            self.mcp = McpServer(mqtt_client=self.mqtt)
             logger.info("MCP Tool Server loaded with %d tools", len(self.mcp.get_tools_schema()))
 
             # ── Feature handlers ──
-            self._publish_progress("loading_handlers", 94, "Loading handlers...")
+            self._publish_progress("loading_handlers", 96, "Loading handlers...")
             from voice_handler import VoiceHandler
             from exploration_handler import ExplorationHandler
 
@@ -274,8 +263,46 @@ class AiService:
         """Remove <think>...</think> blocks from LLM output."""
         return _THINK_RE.sub("", text).strip()
 
+    def transcribe(self, audio_path):
+        """Transcribe audio via the whisper.axcl STT server.
+
+        Sends the audio as base64-encoded data to the /recognize endpoint
+        and returns the transcribed text.
+        """
+        if not os.path.isfile(audio_path):
+            logger.error("Recording not found: %s", audio_path)
+            return ""
+
+        try:
+            with open(audio_path, "rb") as f:
+                audio_data = f.read()
+
+            payload = json.dumps({
+                "base64": base64.b64encode(audio_data).decode("ascii"),
+            }).encode("utf-8")
+
+            url = f"{self.stt_url}/recognize"
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = resp.read().decode("utf-8").strip()
+
+            data = json.loads(result)
+            return data.get("recognition", data.get("text", "")).strip()
+        except Exception as e:
+            logger.error("STT request failed: %s", e)
+            return ""
+
     def synthesize(self, text, prefix="response"):
-        """Synthesize speech with Piper TTS.
+        """Synthesize speech via the melotts.axcl TTS server.
+
+        Posts text to the /synthesize endpoint and decodes the base64 audio
+        response into a WAV file.  The result is resampled to 16 kHz mono
+        S16_LE to match the ReSpeaker's native playback format.
 
         Returns the filename (relative to playback dir) or None on failure.
         """
@@ -284,31 +311,55 @@ class AiService:
         filename = f"{prefix}_{timestamp}.wav"
         output_path = PLAYBACK_DIR / filename
 
-        cmd = [
-            self.piper_binary,
-            "--model", self.piper_model_path,
-            "--output_file", str(output_path),
-        ]
         try:
-            proc = subprocess.run(
-                cmd, input=text,
-                capture_output=True, text=True, timeout=30,
+            payload = json.dumps({
+                "sentence": text,
+                "base64": True,
+            }).encode("utf-8")
+
+            req = urllib.request.Request(
+                f"{self.tts_url}/synthesize",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
             )
-            if proc.returncode != 0:
-                logger.error("Piper error: %s", proc.stderr)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+
+            if not result.get("success"):
+                logger.error("TTS server returned failure: %s", result)
                 return None
-            if not output_path.exists():
-                logger.error("Piper did not create output file")
+
+            audio_data = base64.b64decode(result["base64"])
+            if not audio_data or len(audio_data) < 100:
+                logger.error("TTS server returned empty or invalid audio")
                 return None
+
+            # Write raw TTS output to a temp file, then resample with sox
+            raw_path = str(output_path) + ".raw.wav"
+            with open(raw_path, "wb") as f:
+                f.write(audio_data)
+
+            # Resample to 16 kHz mono (ReSpeaker native format)
+            try:
+                import subprocess as _sp
+                result_sox = _sp.run(
+                    ["sox", raw_path, "-r", "16000", "-c", "1",
+                     "-b", "16", str(output_path)],
+                    capture_output=True, text=True, timeout=15,
+                )
+                os.unlink(raw_path)
+                if result_sox.returncode != 0:
+                    logger.warning("Sox resample failed: %s", result_sox.stderr)
+                    # Fall back to the original file
+                    os.rename(raw_path, str(output_path))
+            except FileNotFoundError:
+                logger.warning("Sox not available — using TTS output as-is")
+                os.rename(raw_path, str(output_path))
+
             return filename
-        except subprocess.TimeoutExpired:
-            logger.error("Piper TTS timed out")
-            return None
-        except FileNotFoundError:
-            logger.error(
-                "Piper binary not found: %s (install with: pip install piper-tts)",
-                self.piper_binary,
-            )
+        except Exception as e:
+            logger.error("TTS request failed: %s", e)
             return None
 
     def get_effective_ai_volume(self):
@@ -325,24 +376,19 @@ class AiService:
         )
 
     @property
-    def whisper_language(self):
-        """Current Whisper STT language code (e.g. 'en', 'ro', 'de')."""
-        return LANGUAGE_CONFIG.get(self._language, LANGUAGE_CONFIG["en"])["whisper"]
+    def stt_language(self):
+        """Current STT language code (e.g. 'en', 'ro', 'de')."""
+        return LANGUAGE_CONFIG.get(self._language, LANGUAGE_CONFIG["en"])["stt_lang"]
+
+    @property
+    def tts_language(self):
+        """Current TTS language code."""
+        return LANGUAGE_CONFIG.get(self._language, LANGUAGE_CONFIG["en"])["tts_lang"]
 
     @property
     def language_instruction(self):
         """LLM instruction for the current language (empty for English)."""
         return LANGUAGE_CONFIG.get(self._language, LANGUAGE_CONFIG["en"])["instruction"]
-
-    def get_piper_model_for_language(self, lang=None):
-        """Return Piper model path for a language. Falls back to default if missing."""
-        lang = lang or self._language
-        cfg = LANGUAGE_CONFIG.get(lang, LANGUAGE_CONFIG["en"])
-        model_path = self._piper_models_dir / cfg["piper_model"]
-        if model_path.is_file():
-            return str(model_path)
-        logger.warning("Piper model not found for '%s': %s — using default", lang, model_path)
-        return self.piper_model_path  # fall back to the one validated at startup
 
     def _apply_language(self, lang):
         """Switch language at runtime (called from MQTT settings handler)."""
@@ -351,10 +397,7 @@ class AiService:
             return
         old = self._language
         self._language = lang
-        new_model = self.get_piper_model_for_language(lang)
-        if new_model != self.piper_model_path:
-            self.piper_model_path = new_model
-        logger.info("Language switched: %s → %s (piper=%s)", old, lang, self.piper_model_path)
+        logger.info("Language switched: %s → %s", old, lang)
 
     def publish_audio(self, filename, volume=None):
         """Send playback command to qBc_Audio."""
@@ -367,20 +410,54 @@ class AiService:
         )
 
     # ------------------------------------------------------------------
-    # axllm server management
+    # Server management
     # ------------------------------------------------------------------
 
-    def _ensure_server(self):
-        """Start axllm serve if not already reachable."""
+    def _wait_for_server(self, url, name, method="GET", timeout=180,
+                         local_launcher=None):
+        """Wait for an HTTP server to become reachable.
+
+        If the server is already up, returns immediately.  If *local_launcher*
+        is provided and the server is not reachable, calls it to start a local
+        process before polling.  Returns True when ready, False on timeout.
+        """
+        # Quick check — already running?
         try:
-            url = self.api_url.rstrip("/") + "/models"
-            req = urllib.request.Request(url, method="GET")
+            req = urllib.request.Request(url, method=method)
             with urllib.request.urlopen(req, timeout=2):
-                logger.info("LLM server already running at %s", self.api_url)
+                logger.info("%s server already running at %s", name, url)
                 return True
         except Exception:
             pass
 
+        # Attempt local launch if a launcher is provided
+        if local_launcher:
+            if not local_launcher():
+                return False
+
+        # Poll until ready
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            try:
+                req = urllib.request.Request(url, method=method)
+                with urllib.request.urlopen(req, timeout=2):
+                    logger.info("%s server ready at %s", name, url)
+                    return True
+            except Exception:
+                pass
+            # Check if local process died
+            if self._axllm_proc and self._axllm_proc.poll() is not None:
+                logger.error("axllm exited with code %d",
+                             self._axllm_proc.returncode)
+                self._axllm_proc = None
+                return False
+
+        logger.error("%s server did not become ready in %ds", name, timeout)
+        return False
+
+    def _launch_axllm(self):
+        """Start axllm serve locally.  Returns True if launched."""
         axllm = shutil.which("axllm")
         if not axllm:
             logger.error("axllm not found in PATH — install it first")
@@ -399,52 +476,24 @@ class AiService:
         )
         atexit.register(self._stop_server)
 
-        server_ready = threading.Event()
-
+        # Read stdout in background for progress reporting
         def _reader():
             for raw in self._axllm_proc.stdout:
                 line = raw.rstrip()
                 if not line:
                     continue
-                if server_ready.is_set():
-                    continue
                 m = _PROGRESS_RE.search(line)
                 if m:
                     pct = int(m.group(1))
                     logger.info("Loading model: %s%%", pct)
-                    # Map axllm 0-100% to overall AI progress 0-68%
                     overall = int(pct * 0.68)
                     self._publish_progress(
                         "loading_llm", overall,
                         f"Loading LLM model: {pct}%",
                     )
-                if "starting" in line.lower() and "server" in line.lower():
-                    logger.info("LLM server ready")
-                    server_ready.set()
 
         threading.Thread(target=_reader, daemon=True).start()
-
-        for _ in range(360):  # up to 180 s
-            if server_ready.is_set():
-                return True
-            time.sleep(0.5)
-            try:
-                url = self.api_url.rstrip("/") + "/models"
-                req = urllib.request.Request(url, method="GET")
-                with urllib.request.urlopen(req, timeout=2):
-                    logger.info("LLM server ready (HTTP check)")
-                    return True
-            except Exception:
-                if self._axllm_proc.poll() is not None:
-                    logger.error(
-                        "axllm exited with code %d",
-                        self._axllm_proc.returncode,
-                    )
-                    self._axllm_proc = None
-                    return False
-
-        logger.error("LLM server did not start in time")
-        return False
+        return True
 
     def _stop_server(self):
         """Terminate the axllm serve subprocess if we started it."""
@@ -550,22 +599,16 @@ def main():
                         help="MQTT broker address")
     parser.add_argument("--mqtt-port", type=int, default=1883,
                         help="MQTT broker port")
-    parser.add_argument("--api-url", default=DEFAULT_API_URL,
-                        help="LLM API base URL")
+    parser.add_argument("--stt-url", default=DEFAULT_STT_URL,
+                        help="STT server base URL (whisper.axcl)")
+    parser.add_argument("--llm-url", default=DEFAULT_LLM_URL,
+                        help="LLM API base URL (axllm serve)")
+    parser.add_argument("--tts-url", default=DEFAULT_TTS_URL,
+                        help="TTS server base URL (melotts.axcl)")
     parser.add_argument("--model", default=DEFAULT_MODEL,
                         help="LLM model name")
     parser.add_argument("--model-dir", default=DEFAULT_MODEL_DIR,
-                        help="Path to axllm model directory")
-    parser.add_argument("--whisper-model", default="tiny",
-                        help="Whisper model size (tiny, base, small, medium)")
-    parser.add_argument("--whisper-device", default="cpu",
-                        help="Whisper device (cpu, cuda)")
-    parser.add_argument("--whisper-compute", default="int8",
-                        help="Whisper compute type (int8, float16, float32)")
-    parser.add_argument("--piper-model", default=DEFAULT_PIPER_MODEL,
-                        help="Path to Piper voice model (.onnx)")
-    parser.add_argument("--piper-binary", default="piper",
-                        help="Path to piper binary")
+                        help="Path to axllm model directory (local mode only)")
     parser.add_argument(
         "--log-level", default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -580,14 +623,11 @@ def main():
     service = AiService(
         broker=args.mqtt_broker,
         port=args.mqtt_port,
-        api_url=args.api_url,
+        stt_url=args.stt_url,
+        llm_url=args.llm_url,
+        tts_url=args.tts_url,
         model_name=args.model,
         model_dir=args.model_dir,
-        whisper_model_size=args.whisper_model,
-        whisper_device=args.whisper_device,
-        whisper_compute_type=args.whisper_compute,
-        piper_model_path=args.piper_model,
-        piper_binary=args.piper_binary,
     )
     service.run()
 

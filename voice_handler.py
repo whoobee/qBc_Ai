@@ -1,7 +1,7 @@
 """
 Voice assistant handler for qBc_Ai.
 
-Pipeline: wake-word recording → Whisper STT → LLM chat → Piper TTS → playback.
+Pipeline: wake-word recording → STT server → LLM chat → TTS server → playback.
 
 MQTT topics:
     Subscribe:  robot/audio/recording_ready
@@ -10,7 +10,6 @@ MQTT topics:
 
 import json
 import logging
-import os
 import threading
 import time
 
@@ -175,19 +174,8 @@ class VoiceHandler:
             self._svc.set_handler_state("voice", "idle")
 
     def _transcribe(self, audio_path):
-        """Transcribe audio file using faster-whisper."""
-        if not os.path.isfile(audio_path):
-            logger.error("Recording not found: %s", audio_path)
-            return ""
-
-        segments, _info = self._svc.whisper.transcribe(
-            audio_path,
-            language=self._svc.whisper_language,
-            beam_size=5,
-            vad_filter=True,
-        )
-        text = " ".join(seg.text.strip() for seg in segments)
-        return text.strip()
+        """Transcribe audio file via the STT HTTP server."""
+        return self._svc.transcribe(audio_path)
 
     def _query_llm(self, user_text):
         """Send transcribed text to LLM and return (response_text, tools_used)."""
