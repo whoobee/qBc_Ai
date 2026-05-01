@@ -26,6 +26,7 @@ logger = logging.getLogger("qBc_Ai.explore")
 TOPIC_EXPLORE_CMD = "robot/ai/explore/cmd"
 TOPIC_EXPLORE_STATE = "robot/ai/explore/state"
 TOPIC_EXPLORE_RESULT = "robot/ai/explore/result"
+TOPIC_EXPLORE_TRANSCRIPT = "robot/ai/explore/transcript"
 TOPIC_NAV_WAYPOINTS = "robot/navigation/waypoints"
 TOPIC_VISION_CMD = "robot/vision/cmd"
 TOPIC_FRAME_READY = "robot/vision/frame_ready"
@@ -365,6 +366,22 @@ class ExplorationHandler:
         # Build user prompt with language-appropriate example narration
         user_prompt = _build_explore_prompt(self._svc._language)
 
+        # Publish the prompt sent to the VLM so the navigation view can show it
+        try:
+            self._svc.mqtt.publish(
+                TOPIC_EXPLORE_TRANSCRIPT,
+                json.dumps({
+                    "phase": "request",
+                    "system_prompt": sys_prompt,
+                    "user_prompt": user_prompt,
+                    "model": self._svc.model_name,
+                    "timestamp": time.time(),
+                }),
+                qos=1,
+            )
+        except Exception as e:
+            logger.debug("Transcript request publish failed: %s", e)
+
         messages = [
             {
                 "role": "system",
@@ -390,4 +407,21 @@ class ExplorationHandler:
             max_tokens=384,
         )
         text = response.choices[0].message.content
-        return self._svc.strip_think_tags(text)
+        clean = self._svc.strip_think_tags(text)
+
+        # Publish the raw VLM output
+        try:
+            self._svc.mqtt.publish(
+                TOPIC_EXPLORE_TRANSCRIPT,
+                json.dumps({
+                    "phase": "response",
+                    "raw": text,
+                    "clean": clean,
+                    "timestamp": time.time(),
+                }),
+                qos=1,
+            )
+        except Exception as e:
+            logger.debug("Transcript response publish failed: %s", e)
+
+        return clean
